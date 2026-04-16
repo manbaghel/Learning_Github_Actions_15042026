@@ -80,6 +80,7 @@ jobs:
           sf project deploy start \
             --manifest manifest/package.xml \
             --target-org qa-org \
+            --test-level RunLocalTests \
             --wait 10
 
 # -------------------------------
@@ -116,6 +117,7 @@ jobs:
           sf project deploy start \
             --manifest manifest/package.xml \
             --target-org uat-org \
+            --test-level RunLocalTests \
             --wait 10
 
 # -------------------------------

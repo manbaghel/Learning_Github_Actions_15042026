@@ -1,0 +1,113 @@
+name: Salesforce PR Validation
+
+on:
+  pull_request:
+    branches:
+      - develop
+      - main
+      - 'release/*'
+      - 'uat/*'
+
+jobs:
+
+# -------------------------------
+# Code Quality & Security Checks
+# -------------------------------
+  code-analysis:
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Salesforce CLI
+        run: |
+          npm install --global @salesforce/cli
+
+      - name: Install Salesforce Code Analyzer
+        run: |
+          sf plugins install @salesforce/sfdx-scanner
+
+      - name: Run Code Analysis
+        run: |
+          sf scanner run \
+            --target force-app \
+            --format table \
+            --severity-threshold 2
+
+      - name: Check for Destructive Changes
+        run: |
+          if find . -name "destructiveChanges*.xml" | grep -q .; then
+            echo "ERROR: Destructive changes files detected!"
+            find . -name "destructiveChanges*.xml"
+            echo "Destructive deployments are blocked in this pipeline."
+            echo "Remove destructive changes files or handle them manually."
+            exit 1
+          fi
+          echo "No destructive changes detected. Proceeding..."
+
+# -----------------------------------------
+# Dry-Run Validation Against Target Org
+# -----------------------------------------
+  validate-deployment:
+    needs: code-analysis
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Salesforce CLI
+        run: |
+          npm install --global @salesforce/cli
+
+      - name: Determine Target Org
+        id: target
+        run: |
+          BASE_REF="${{ github.base_ref }}"
+          if [[ "$BASE_REF" == "develop" ]]; then
+            echo "org_alias=dev-org" >> "$GITHUB_OUTPUT"
+            echo "auth_secret=SF_DEV_AUTH_URL" >> "$GITHUB_OUTPUT"
+            echo "test_level=" >> "$GITHUB_OUTPUT"
+          elif [[ "$BASE_REF" == release/* ]]; then
+            echo "org_alias=qa-org" >> "$GITHUB_OUTPUT"
+            echo "auth_secret=SF_QA_AUTH_URL" >> "$GITHUB_OUTPUT"
+            echo "test_level=--test-level RunLocalTests" >> "$GITHUB_OUTPUT"
+          elif [[ "$BASE_REF" == uat/* ]]; then
+            echo "org_alias=uat-org" >> "$GITHUB_OUTPUT"
+            echo "auth_secret=SF_UAT_AUTH_URL" >> "$GITHUB_OUTPUT"
+            echo "test_level=--test-level RunLocalTests" >> "$GITHUB_OUTPUT"
+          elif [[ "$BASE_REF" == "main" ]]; then
+            echo "org_alias=prod-org" >> "$GITHUB_OUTPUT"
+            echo "auth_secret=SF_PROD_AUTH_URL" >> "$GITHUB_OUTPUT"
+            echo "test_level=--test-level RunLocalTests" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Authenticate Target Org
+        run: |
+          echo "${{ secrets[steps.target.outputs.auth_secret] }}" > auth.txt
+          sf org login sfdx-url \
+            --sfdx-url-file auth.txt \
+            --alias ${{ steps.target.outputs.org_alias }}
+          rm -f auth.txt
+
+      - name: Validate Deployment (Dry Run)
+        run: |
+          sf project deploy start \
+            --manifest manifest/package.xml \
+            --target-org ${{ steps.target.outputs.org_alias }} \
+            --dry-run \
+            ${{ steps.target.outputs.test_level }} \
+            --wait 20
