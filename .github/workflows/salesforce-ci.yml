@@ -43,6 +43,7 @@ jobs:
           sf project deploy start \
             --manifest manifest/package.xml \
             --target-org dev-org \
+            --ignore-conflicts \
             --wait 10
 
 # -------------------------------
@@ -79,6 +80,7 @@ jobs:
           sf project deploy start \
             --manifest manifest/package.xml \
             --target-org qa-org \
+            --ignore-conflicts \
             --wait 10
 
 # -------------------------------
@@ -116,6 +118,7 @@ jobs:
           sf project deploy start \
             --manifest manifest/package.xml \
             --target-org uat-org \
+            --ignore-conflicts \
             --wait 10
 
 # -------------------------------
@@ -153,5 +156,6 @@ jobs:
           sf project deploy start \
             --manifest manifest/package.xml \
             --target-org prod-org \
+            --ignore-conflicts \
             --test-level RunLocalTests \
             --wait 20
