@@ -43,6 +43,8 @@ jobs:
           sf project deploy start \
             --manifest manifest/package.xml \
             --target-org dev-org \
+            --ignore-conflicts \
+            --test-level RunLocalTests \
             --wait 10
 
 # -------------------------------
@@ -79,6 +81,8 @@ jobs:
           sf project deploy start \
             --manifest manifest/package.xml \
             --target-org qa-org \
+            --ignore-conflicts \
+            --test-level RunLocalTests \
             --wait 10
 
 # -------------------------------
@@ -116,14 +120,17 @@ jobs:
           sf project deploy start \
             --manifest manifest/package.xml \
             --target-org uat-org \
+            --ignore-conflicts \
+            --test-level RunLocalTests \
             --wait 10
 
 # -------------------------------
 # Deploy to PROD
 # -------------------------------
   deploy-prod:
-    if: github.ref == 'refs/heads/main'
+    if: startsWith(github.ref, 'refs/heads/release/')
     runs-on: ubuntu-latest
+    needs: deploy-uat
     environment: production
 
     steps:
@@ -153,5 +160,6 @@ jobs:
           sf project deploy start \
             --manifest manifest/package.xml \
             --target-org prod-org \
+            --ignore-conflicts \
             --test-level RunLocalTests \
             --wait 20
