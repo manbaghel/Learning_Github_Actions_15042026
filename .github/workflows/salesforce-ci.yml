@@ -1,19 +1,108 @@
-name: Salesforce Multi-Org CI/CD Pipeline
+name: Salesforce Multi-Org CI/CD Pipeline (Delta)
 
 on:
   push:
     branches:
-      - develop
-      - main
-      - 'release/*'
+      - '**'
 
 jobs:
+
+# -------------------------------
+# Generate Delta Package
+# -------------------------------
+  delta:
+    runs-on: ubuntu-latest
+    outputs:
+      has_delta: ${{ steps.delta-check.outputs.has_delta }}
+      has_destructive: ${{ steps.delta-check.outputs.has_destructive }}
+      from_sha: ${{ steps.delta-range.outputs.from_sha }}
+
+    steps:
+
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Salesforce CLI
+        run: npm install --global @salesforce/cli
+
+      - name: Install sfdx-git-delta Plugin
+        run: echo y | sf plugins install sfdx-git-delta
+
+      - name: Resolve Delta Range
+        id: delta-range
+        run: |
+          BEFORE="${{ github.event.before }}"
+          ZERO_SHA="0000000000000000000000000000000000000000"
+
+          if [ -z "$BEFORE" ] || [ "$BEFORE" = "$ZERO_SHA" ]; then
+            echo "First push on this branch - falling back to HEAD~1."
+            if git rev-parse HEAD~1 >/dev/null 2>&1; then
+              FROM_SHA=$(git rev-parse HEAD~1)
+            else
+              FROM_SHA=$(git rev-parse HEAD)
+            fi
+          else
+            FROM_SHA="$BEFORE"
+          fi
+
+          echo "from_sha=$FROM_SHA" >> "$GITHUB_OUTPUT"
+          echo "Delta range: $FROM_SHA..HEAD"
+
+      - name: Generate Delta Package
+        run: |
+          mkdir -p delta
+          sf sgd source delta \
+            --to HEAD \
+            --from ${{ steps.delta-range.outputs.from_sha }} \
+            --output delta/ \
+            --generate-delta \
+            --source force-app
+
+          echo "------ Delta package.xml ------"
+          cat delta/package/package.xml || echo "(no delta package.xml generated)"
+
+          if [ -f delta/destructiveChanges/destructiveChanges.xml ]; then
+            echo "------ Destructive Changes ------"
+            cat delta/destructiveChanges/destructiveChanges.xml
+          fi
+
+      - name: Check Delta Contents
+        id: delta-check
+        run: |
+          if [ -f delta/package/package.xml ] && grep -q "<types>" delta/package/package.xml; then
+            echo "has_delta=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_delta=false" >> "$GITHUB_OUTPUT"
+            echo "No metadata changes detected."
+          fi
+
+          if [ -f delta/destructiveChanges/destructiveChanges.xml ] && grep -q "<types>" delta/destructiveChanges/destructiveChanges.xml; then
+            echo "has_destructive=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_destructive=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload Delta Artifact
+        if: steps.delta-check.outputs.has_delta == 'true' || steps.delta-check.outputs.has_destructive == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: delta-package
+          path: delta/
+          retention-days: 7
 
 # -------------------------------
 # Deploy to DEV
 # -------------------------------
   deploy-dev:
-    if: github.ref == 'refs/heads/develop'
+    needs: delta
+    if: github.ref == 'refs/heads/develop' && (needs.delta.outputs.has_delta == 'true' || needs.delta.outputs.has_destructive == 'true')
     runs-on: ubuntu-latest
 
     steps:
@@ -27,8 +116,13 @@ jobs:
           node-version: 20
 
       - name: Install Salesforce CLI
-        run: |
-          npm install --global @salesforce/cli
+        run: npm install --global @salesforce/cli
+
+      - name: Download Delta Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: delta-package
+          path: delta/
 
       - name: Authenticate DEV Org
         run: |
@@ -38,10 +132,24 @@ jobs:
             --alias dev-org
           rm -f auth.txt
 
-      - name: Deploy to DEV Org
+      - name: Deploy Delta to DEV Org
+        if: needs.delta.outputs.has_delta == 'true'
+        run: |
+          DESTRUCTIVE_FLAG=""
+          if [ "${{ needs.delta.outputs.has_destructive }}" = "true" ]; then
+            DESTRUCTIVE_FLAG="--post-destructive-changes delta/destructiveChanges/destructiveChanges.xml"
+          fi
+          sf project deploy start \
+            --manifest delta/package/package.xml \
+            $DESTRUCTIVE_FLAG \
+            --target-org dev-org \
+            --wait 10
+
+      - name: Deploy Destructive-Only to DEV Org
+        if: needs.delta.outputs.has_delta != 'true' && needs.delta.outputs.has_destructive == 'true'
         run: |
           sf project deploy start \
-            --manifest manifest/package.xml \
+            --manifest delta/destructiveChanges/destructiveChanges.xml \
             --target-org dev-org \
             --ignore-conflicts \
             --test-level RunLocalTests \
@@ -51,7 +159,8 @@ jobs:
 # Deploy to QA
 # -------------------------------
   deploy-qa:
-    if: startsWith(github.ref, 'refs/heads/release/')
+    needs: delta
+    if: startsWith(github.ref, 'refs/heads/release/') && (needs.delta.outputs.has_delta == 'true' || needs.delta.outputs.has_destructive == 'true')
     runs-on: ubuntu-latest
 
     steps:
@@ -65,8 +174,13 @@ jobs:
           node-version: 20
 
       - name: Install Salesforce CLI
-        run: |
-          npm install --global @salesforce/cli
+        run: npm install --global @salesforce/cli
+
+      - name: Download Delta Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: delta-package
+          path: delta/
 
       - name: Authenticate QA Org
         run: |
@@ -76,10 +190,25 @@ jobs:
             --alias qa-org
           rm -f auth.txt
 
-      - name: Deploy to QA Org
+      - name: Deploy Delta to QA Org
+        if: needs.delta.outputs.has_delta == 'true'
+        run: |
+          DESTRUCTIVE_FLAG=""
+          if [ "${{ needs.delta.outputs.has_destructive }}" = "true" ]; then
+            DESTRUCTIVE_FLAG="--post-destructive-changes delta/destructiveChanges/destructiveChanges.xml"
+          fi
+          sf project deploy start \
+            --manifest delta/package/package.xml \
+            $DESTRUCTIVE_FLAG \
+            --target-org qa-org \
+            --test-level RunLocalTests \
+            --wait 10
+
+      - name: Deploy Destructive-Only to QA Org
+        if: needs.delta.outputs.has_delta != 'true' && needs.delta.outputs.has_destructive == 'true'
         run: |
           sf project deploy start \
-            --manifest manifest/package.xml \
+            --manifest delta/destructiveChanges/destructiveChanges.xml \
             --target-org qa-org \
             --ignore-conflicts \
             --test-level RunLocalTests \
@@ -89,9 +218,9 @@ jobs:
 # Deploy to UAT
 # -------------------------------
   deploy-uat:
-    if: startsWith(github.ref, 'refs/heads/release/')
+    needs: delta
+    if: startsWith(github.ref, 'refs/heads/uat/') && (needs.delta.outputs.has_delta == 'true' || needs.delta.outputs.has_destructive == 'true')
     runs-on: ubuntu-latest
-    needs: deploy-qa
 
     steps:
 
@@ -104,8 +233,13 @@ jobs:
           node-version: 20
 
       - name: Install Salesforce CLI
-        run: |
-          npm install --global @salesforce/cli
+        run: npm install --global @salesforce/cli
+
+      - name: Download Delta Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: delta-package
+          path: delta/
 
       - name: Authenticate UAT Org
         run: |
@@ -115,10 +249,25 @@ jobs:
             --alias uat-org
           rm -f auth.txt
 
-      - name: Deploy to UAT Org
+      - name: Deploy Delta to UAT Org
+        if: needs.delta.outputs.has_delta == 'true'
+        run: |
+          DESTRUCTIVE_FLAG=""
+          if [ "${{ needs.delta.outputs.has_destructive }}" = "true" ]; then
+            DESTRUCTIVE_FLAG="--post-destructive-changes delta/destructiveChanges/destructiveChanges.xml"
+          fi
+          sf project deploy start \
+            --manifest delta/package/package.xml \
+            $DESTRUCTIVE_FLAG \
+            --target-org uat-org \
+            --test-level RunLocalTests \
+            --wait 10
+
+      - name: Deploy Destructive-Only to UAT Org
+        if: needs.delta.outputs.has_delta != 'true' && needs.delta.outputs.has_destructive == 'true'
         run: |
           sf project deploy start \
-            --manifest manifest/package.xml \
+            --manifest delta/destructiveChanges/destructiveChanges.xml \
             --target-org uat-org \
             --ignore-conflicts \
             --test-level RunLocalTests \
@@ -144,8 +293,13 @@ jobs:
           node-version: 20
 
       - name: Install Salesforce CLI
-        run: |
-          npm install --global @salesforce/cli
+        run: npm install --global @salesforce/cli
+
+      - name: Download Delta Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: delta-package
+          path: delta/
 
       - name: Authenticate PROD Org
         run: |
@@ -155,11 +309,58 @@ jobs:
             --alias prod-org
           rm -f auth.txt
 
-      - name: Deploy to PROD Org
+      - name: Deploy Delta to PROD Org
+        if: needs.delta.outputs.has_delta == 'true'
+        run: |
+          DESTRUCTIVE_FLAG=""
+          if [ "${{ needs.delta.outputs.has_destructive }}" = "true" ]; then
+            DESTRUCTIVE_FLAG="--post-destructive-changes delta/destructiveChanges/destructiveChanges.xml"
+          fi
+          sf project deploy start \
+            --manifest delta/package/package.xml \
+            $DESTRUCTIVE_FLAG \
+            --target-org prod-org \
+            --test-level RunLocalTests \
+            --wait 20
+
+      - name: Deploy Destructive-Only to PROD Org
+        if: needs.delta.outputs.has_delta != 'true' && needs.delta.outputs.has_destructive == 'true'
         run: |
           sf project deploy start \
-            --manifest manifest/package.xml \
+            --manifest delta/destructiveChanges/destructiveChanges.xml \
             --target-org prod-org \
             --ignore-conflicts \
             --test-level RunLocalTests \
             --wait 20
+
+# -------------------------------
+# Feature Branches - Build Artifact Only
+# -------------------------------
+  build-feature-artifact:
+    needs: delta
+    if: >
+      github.ref != 'refs/heads/develop' &&
+      github.ref != 'refs/heads/main' &&
+      !startsWith(github.ref, 'refs/heads/release/') &&
+      !startsWith(github.ref, 'refs/heads/uat/') &&
+      (needs.delta.outputs.has_delta == 'true' || needs.delta.outputs.has_destructive == 'true')
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Download Delta Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: delta-package
+          path: delta/
+
+      - name: Summarize Feature Delta
+        run: |
+          echo "Feature branch push detected - no target org configured for '${{ github.ref_name }}'."
+          echo "Delta artifact was generated and uploaded for review."
+          echo "------ Delta package.xml ------"
+          cat delta/package/package.xml || true
+          if [ -f delta/destructiveChanges/destructiveChanges.xml ]; then
+            echo "------ Destructive Changes ------"
+            cat delta/destructiveChanges/destructiveChanges.xml
+          fi
