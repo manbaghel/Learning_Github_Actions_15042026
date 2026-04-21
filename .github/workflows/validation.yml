@@ -1,25 +1,101 @@
-name: Salesforce PR Validation
+name: Salesforce PR Validation (Delta)
 
 on:
   pull_request:
     branches:
-      - develop
-      - main
-      - 'release/*'
-      - 'uat/*'
+      - '**'
 
 jobs:
+
+# -------------------------------
+# Generate Delta Package
+# -------------------------------
+  delta:
+    runs-on: ubuntu-latest
+    outputs:
+      has_delta: ${{ steps.delta-check.outputs.has_delta }}
+      has_destructive: ${{ steps.delta-check.outputs.has_destructive }}
+
+    steps:
+
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Fetch Base Branch
+        run: |
+          git fetch origin ${{ github.base_ref }} --depth=50
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Salesforce CLI
+        run: npm install --global @salesforce/cli
+
+      - name: Install sfdx-git-delta Plugin
+        run: echo y | sf plugins install sfdx-git-delta
+
+      - name: Generate Delta Package
+        run: |
+          mkdir -p delta
+          sf sgd source delta \
+            --to HEAD \
+            --from origin/${{ github.base_ref }} \
+            --output delta/ \
+            --generate-delta \
+            --source force-app
+
+          echo "------ Delta package.xml ------"
+          cat delta/package/package.xml || echo "(no delta package.xml generated)"
+
+          if [ -f delta/destructiveChanges/destructiveChanges.xml ]; then
+            echo "------ Destructive Changes ------"
+            cat delta/destructiveChanges/destructiveChanges.xml
+          fi
+
+      - name: Check Delta Contents
+        id: delta-check
+        run: |
+          if [ -f delta/package/package.xml ] && grep -q "<types>" delta/package/package.xml; then
+            echo "has_delta=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_delta=false" >> "$GITHUB_OUTPUT"
+            echo "No metadata changes detected."
+          fi
+
+          if [ -f delta/destructiveChanges/destructiveChanges.xml ] && grep -q "<types>" delta/destructiveChanges/destructiveChanges.xml; then
+            echo "has_destructive=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_destructive=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload Delta Artifact
+        if: steps.delta-check.outputs.has_delta == 'true' || steps.delta-check.outputs.has_destructive == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: delta-package
+          path: delta/
+          retention-days: 7
 
 # -------------------------------
 # Code Quality & Security Checks
 # -------------------------------
   code-analysis:
+    needs: delta
+    if: needs.delta.outputs.has_delta == 'true'
     runs-on: ubuntu-latest
 
     steps:
 
       - name: Checkout Repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -27,36 +103,44 @@ jobs:
           node-version: 20
 
       - name: Install Salesforce CLI
-        run: |
-          npm install --global @salesforce/cli
+        run: npm install --global @salesforce/cli
 
       - name: Install Salesforce Code Analyzer
-        run: |
-          sf plugins install @salesforce/sfdx-scanner
+        run: sf plugins install @salesforce/sfdx-scanner
 
-      - name: Run Code Analysis
-        run: |
-          sf scanner run \
-            --target force-app \
-            --format table \
-            --severity-threshold 2
+      - name: Download Delta Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: delta-package
+          path: delta/
 
-      - name: Check for Destructive Changes
+      - name: Block Manual Destructive Changes
         run: |
-          if find . -name "destructiveChanges*.xml" | grep -q .; then
-            echo "ERROR: Destructive changes files detected!"
-            find . -name "destructiveChanges*.xml"
-            echo "Destructive deployments are blocked in this pipeline."
-            echo "Remove destructive changes files or handle them manually."
+          if find . -path ./delta -prune -o -name "destructiveChanges*.xml" -print | grep -q .; then
+            echo "ERROR: Manually committed destructive changes files detected!"
+            find . -path ./delta -prune -o -name "destructiveChanges*.xml" -print
+            echo "Destructive deployments must be managed via git deletions (delta), not hand-crafted XML."
             exit 1
           fi
-          echo "No destructive changes detected. Proceeding..."
+          echo "No manually committed destructive changes. Proceeding..."
+
+      - name: Run Code Analysis on Delta Sources
+        run: |
+          if [ ! -d delta/force-app ] || [ -z "$(ls -A delta/force-app 2>/dev/null)" ]; then
+            echo "No source files in delta. Skipping code analyzer."
+            exit 0
+          fi
+          sf scanner run \
+            --target "delta/force-app" \
+            --format table \
+            --severity-threshold 2
 
 # -----------------------------------------
 # Dry-Run Validation Against Target Org
 # -----------------------------------------
   validate-deployment:
-    needs: code-analysis
+    needs: [delta, code-analysis]
+    if: needs.delta.outputs.has_delta == 'true' || needs.delta.outputs.has_destructive == 'true'
     runs-on: ubuntu-latest
 
     steps:
@@ -70,8 +154,13 @@ jobs:
           node-version: 20
 
       - name: Install Salesforce CLI
-        run: |
-          npm install --global @salesforce/cli
+        run: npm install --global @salesforce/cli
+
+      - name: Download Delta Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: delta-package
+          path: delta/
 
       - name: Determine Target Org
         id: target
@@ -81,21 +170,29 @@ jobs:
             echo "org_alias=dev-org" >> "$GITHUB_OUTPUT"
             echo "auth_secret=SF_DEV_AUTH_URL" >> "$GITHUB_OUTPUT"
             echo "test_level=" >> "$GITHUB_OUTPUT"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
           elif [[ "$BASE_REF" == release/* ]]; then
             echo "org_alias=qa-org" >> "$GITHUB_OUTPUT"
             echo "auth_secret=SF_QA_AUTH_URL" >> "$GITHUB_OUTPUT"
             echo "test_level=--test-level RunLocalTests" >> "$GITHUB_OUTPUT"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
           elif [[ "$BASE_REF" == uat/* ]]; then
             echo "org_alias=uat-org" >> "$GITHUB_OUTPUT"
             echo "auth_secret=SF_UAT_AUTH_URL" >> "$GITHUB_OUTPUT"
             echo "test_level=--test-level RunLocalTests" >> "$GITHUB_OUTPUT"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
           elif [[ "$BASE_REF" == "main" ]]; then
             echo "org_alias=prod-org" >> "$GITHUB_OUTPUT"
             echo "auth_secret=SF_PROD_AUTH_URL" >> "$GITHUB_OUTPUT"
             echo "test_level=--test-level RunLocalTests" >> "$GITHUB_OUTPUT"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "No target org mapped for base branch '$BASE_REF'. Skipping org validation."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Authenticate Target Org
+        if: steps.target.outputs.skip == 'false'
         run: |
           echo "${{ secrets[steps.target.outputs.auth_secret] }}" > auth.txt
           sf org login sfdx-url \
@@ -103,10 +200,26 @@ jobs:
             --alias ${{ steps.target.outputs.org_alias }}
           rm -f auth.txt
 
-      - name: Validate Deployment (Dry Run)
+      - name: Validate Delta Deployment (Dry Run)
+        if: steps.target.outputs.skip == 'false' && needs.delta.outputs.has_delta == 'true'
+        run: |
+          DESTRUCTIVE_FLAG=""
+          if [ "${{ needs.delta.outputs.has_destructive }}" = "true" ]; then
+            DESTRUCTIVE_FLAG="--post-destructive-changes delta/destructiveChanges/destructiveChanges.xml"
+          fi
+          sf project deploy start \
+            --manifest delta/package/package.xml \
+            $DESTRUCTIVE_FLAG \
+            --target-org ${{ steps.target.outputs.org_alias }} \
+            --dry-run \
+            ${{ steps.target.outputs.test_level }} \
+            --wait 20
+
+      - name: Validate Destructive-Only Deployment (Dry Run)
+        if: steps.target.outputs.skip == 'false' && needs.delta.outputs.has_delta != 'true' && needs.delta.outputs.has_destructive == 'true'
         run: |
           sf project deploy start \
-            --manifest manifest/package.xml \
+            --manifest delta/destructiveChanges/destructiveChanges.xml \
             --target-org ${{ steps.target.outputs.org_alias }} \
             --dry-run \
             ${{ steps.target.outputs.test_level }} \
